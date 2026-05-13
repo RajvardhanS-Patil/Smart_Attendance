@@ -1,0 +1,309 @@
+// ============================================================
+//  SmartAttend — Google Apps Script  ★ FIXED VERSION ★
+//  KEY FIX: All time/date cells now formatted as strings
+//  before being sent to the dashboard, so no more
+//  "Sat Dec 30 1899" phantom dates.
+// ============================================================
+
+const SPREADSHEET_ID = "1FkBVXXP0ITja1dZSuXFpoaeyQxsqM4BETyfxPFebrW8";
+const FAST2SMS_KEY   = "PB9Nub1XR6mfhcstp8rzVa4l3e52qOMLyTxJZ7AYi0QwvIGDkK38vr9MLJElyAPjiCWGf74BFXhDSo2b";
+const SCHOOL_NAME    = "VIT Pune";
+const LATE_HOUR      = 9;
+const LATE_MINUTE    = 0;
+
+const SEND_SMS       = false;
+const SEND_WHATSAPP  = true;
+const SEND_EMAIL     = true;
+
+// ── MAIN ENTRY POINT ───────────────────────────────────────
+function doGet(e) {
+  const output = ContentService.createTextOutput();
+  output.setMimeType(ContentService.MimeType.JSON);
+
+  try {
+    const action = e.parameter.action || "log";
+
+    if (action === "getAttendance") {
+      output.setContent(JSON.stringify(getAttendanceData()));
+      return output;
+    }
+    if (action === "log" || e.parameter.uid) {
+      output.setContent(JSON.stringify(handleScan(e)));
+      return output;
+    }
+    if (action === "getStudents") {
+      output.setContent(JSON.stringify(getStudentList()));
+      return output;
+    }
+
+    output.setContent(JSON.stringify({ success: false, error: "Unknown action" }));
+    return output;
+
+  } catch (err) {
+    output.setContent(JSON.stringify({ success: false, error: err.message }));
+    return output;
+  }
+}
+
+// ── HANDLE ESP32 SCAN ──────────────────────────────────────
+function handleScan(e) {
+  const uid    = e.parameter.uid    || "UNKNOWN";
+  const name   = e.parameter.name   || "UNKNOWN";
+  const roll   = e.parameter.roll   || "N/A";
+  const status = e.parameter.status || "PRESENT";
+  const time   = e.parameter.time   || getCurrentTime();
+
+  const ss        = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const attSheet  = ss.getSheetByName("Attendance");
+  const studSheet = ss.getSheetByName("Students");
+
+  const tz      = "Asia/Kolkata";
+  const now     = new Date();
+  const dateStr = Utilities.formatDate(now, tz, "dd/MM/yyyy");
+  const tsStr   = Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss");
+
+  const allData = attSheet.getDataRange().getValues();
+  const today   = Utilities.formatDate(now, tz, "dd/MM/yyyy");
+  let existingRow = -1;
+
+  for (let i = allData.length - 1; i >= 1; i--) {
+    // FIX: use safeFormatCell so date comparison works even if cell is a Date object
+    const rowDate = safeFormatCell(allData[i][6], "date");
+    const rowUID  = String(allData[i][1]);
+    const rowOut  = safeFormatCell(allData[i][5], "time");
+    if (rowUID === uid && rowDate === today && rowOut === "") {
+      existingRow = i + 1;
+      break;
+    }
+  }
+
+  let scanType    = "IN";
+  let finalStatus = status;
+  const [h, m] = time.split(":").map(Number);
+  const isLate = (h > LATE_HOUR) || (h === LATE_HOUR && m > LATE_MINUTE);
+
+  if (existingRow > 0) {
+    scanType    = "OUT";
+    finalStatus = safeFormatCell(allData[existingRow - 1][5], "status") || status;
+    const remarks = `OUT at ${time}`;
+
+    // Write as plain text strings — NOT as Date objects
+    attSheet.getRange(existingRow, 6).setValue(time);
+    attSheet.getRange(existingRow, 8).setValue(remarks);
+    attSheet.getRange(existingRow, 9).setValue(tsStr);
+
+  } else {
+    scanType    = "IN";
+    finalStatus = (status === "DENIED") ? "DENIED" : (isLate ? "LATE" : "PRESENT");
+    const remarks = finalStatus === "LATE"   ? `Late at ${time}` :
+                    finalStatus === "DENIED" ? "Denied"          : "On time";
+
+    // All values written as strings — no Date objects — prevents 1899 bug
+    attSheet.appendRow([tsStr, uid, name, roll, time, "", dateStr, remarks, ""]);
+  }
+
+  // Notifications
+  if (uid !== "UNKNOWN" && finalStatus !== "DENIED") {
+    const msg     = buildMessage(name, roll, finalStatus, time, dateStr, scanType, time);
+    const contact = getStudentContact(studSheet, roll);
+    if (SEND_SMS && contact.phones.length > 0)          sendFast2SMS(contact.phones.join(","), msg);
+    if (SEND_WHATSAPP && contact.waNumber && contact.waKey) sendWhatsApp(contact.waNumber, msg, contact.waKey);
+    if (SEND_EMAIL && contact.email)                    sendEmail(contact.email, name, roll, finalStatus, scanType, time, dateStr);
+  }
+
+  return { success: true, scanType, status: finalStatus, name, time };
+}
+
+// ── SAFE CELL FORMATTER ────────────────────────────────────
+// This is THE fix for "Sat Dec 30 1899".
+// Google Sheets stores time-of-day as a fraction (e.g. 0.694 = 16:39)
+// and dates as an integer (e.g. 46155 = 13/05/2026).
+// When GAS reads these back, they come as JS Date objects.
+// String(date_object) gives the ugly long string.
+// We must detect Date objects and format them properly.
+function safeFormatCell(value, type) {
+  if (value === null || value === undefined || value === "") return "";
+
+  const tz = "Asia/Kolkata";
+
+  // If it's a JS Date object (this is what causes the 1899 bug)
+  if (value instanceof Date) {
+    if (isNaN(value.getTime())) return "";
+    if (type === "date") {
+      return Utilities.formatDate(value, tz, "dd/MM/yyyy");
+    }
+    if (type === "time") {
+      return Utilities.formatDate(value, tz, "HH:mm");
+    }
+    // timestamp or unknown
+    return Utilities.formatDate(value, tz, "dd/MM/yyyy HH:mm:ss");
+  }
+
+  // If it's a number (raw serial from Sheets)
+  if (typeof value === "number") {
+    // Sheets time serial: fraction < 2 (time of day only)
+    // Sheets date serial: integer >= 1 (days since Dec 30 1899)
+    if (value > 0 && value < 2 && type === "time") {
+      // Convert fractional day to HH:MM
+      const totalMins = Math.round(value * 24 * 60);
+      const hh = Math.floor(totalMins / 60) % 24;
+      const mm = totalMins % 60;
+      return String(hh).padStart(2,"0") + ":" + String(mm).padStart(2,"0");
+    }
+    if (value >= 1 && type === "date") {
+      // Convert Sheets date serial to Date
+      const epoch = new Date(Date.UTC(1899, 11, 30) + value * 86400000);
+      return Utilities.formatDate(epoch, tz, "dd/MM/yyyy");
+    }
+    return String(value);
+  }
+
+  // Plain string — return as-is (already formatted correctly by ESP32)
+  return String(value).trim();
+}
+
+// ── GET ALL ATTENDANCE DATA (for website) ─────────────────
+function getAttendanceData() {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName("Attendance");
+  const data  = sheet.getDataRange().getValues();
+
+  if (data.length <= 1) return [];
+
+  const tz = "Asia/Kolkata";
+  const records = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[1]) continue;
+
+    // ★ Use safeFormatCell for every time/date column
+    const timestamp = safeFormatCell(row[0], "timestamp");
+    const uid       = String(row[1] || "").trim();
+    const name      = String(row[2] || "").trim();
+    const roll      = String(row[3] || "").trim();
+    const inTime    = safeFormatCell(row[4], "time");   // Col E — IN time
+    const outTime   = safeFormatCell(row[5], "time");   // Col F — OUT time
+    const date      = safeFormatCell(row[6], "date");   // Col G — date dd/MM/yyyy
+    const remarks   = String(row[7] || "").trim();
+
+    if (!date || !uid) continue;  // skip completely blank rows
+
+    records.push({
+      timestamp,
+      uid,
+      name,
+      roll,
+      inTime,
+      outTime,
+      date,
+      remarks,
+      status: deriveStatus(remarks, inTime),
+      time:   inTime,  // backward compat
+    });
+  }
+
+  return records.reverse(); // newest first
+}
+
+// ── DERIVE STATUS ─────────────────────────────────────────
+function deriveStatus(remarks, inTime) {
+  if (!remarks && !inTime) return "ABSENT";
+  const r = (remarks || "").toLowerCase();
+  if (r.includes("denied")) return "DENIED";
+  if (r.includes("late") || (inTime && isLateTime(inTime))) return "LATE";
+  return "PRESENT";
+}
+
+function isLateTime(timeStr) {
+  if (!timeStr || !timeStr.includes(":")) return false;
+  const [h, m] = timeStr.split(":").map(Number);
+  return (h > LATE_HOUR) || (h === LATE_HOUR && m > LATE_MINUTE);
+}
+
+// ── GET STUDENT CONTACT INFO ──────────────────────────────
+function getStudentContact(sheet, roll) {
+  if (!sheet) return { phones: [], waNumber: '', waKey: '', email: '' };
+  const rows = sheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][2]) === roll) {
+      const phones = [];
+      if (rows[i][3]) phones.push(String(rows[i][3]).replace(/\D/g, "").slice(-10));
+      if (rows[i][4]) phones.push(String(rows[i][4]).replace(/\D/g, "").slice(-10));
+      return {
+        phones:   phones.filter(p => p.length === 10),
+        waNumber: String(rows[i][5] || "").replace(/\D/g, ""),
+        waKey:    String(rows[i][6] || ""),
+        email:    String(rows[i][7] || ""),
+      };
+    }
+  }
+  return { phones: [], waNumber: '', waKey: '', email: '' };
+}
+
+// ── BUILD NOTIFICATION MESSAGE ────────────────────────────
+function buildMessage(name, roll, status, time, date, scanType, displayTime) {
+  if (scanType === "OUT")      return `${SCHOOL_NAME}: ${name} (${roll}) checked OUT at ${displayTime} on ${date}. Safe journey! - SmartAttend`;
+  if (status === "PRESENT")    return `${SCHOOL_NAME}: ${name} (${roll}) is PRESENT. Arrived at ${time} on ${date}. - SmartAttend`;
+  if (status === "LATE")       return `${SCHOOL_NAME}: ${name} (${roll}) arrived LATE at ${time} on ${date}. - SmartAttend`;
+  return `${SCHOOL_NAME}: Card scan recorded for ${name} at ${time}. - SmartAttend`;
+}
+
+// ── SEND WHATSAPP VIA CALLMEBOT ───────────────────────────
+function sendWhatsApp(phone, message, apiKey) {
+  try {
+    const url = "https://api.callmebot.com/whatsapp.php?phone=91" + phone +
+                "&text=" + encodeURIComponent(message) + "&apikey=" + apiKey;
+    UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  } catch (err) { Logger.log("WhatsApp failed: " + err.message); }
+}
+
+// ── SEND EMAIL VIA GMAIL ──────────────────────────────────
+function sendEmail(toEmail, name, roll, status, scanType, time, date) {
+  try {
+    const subject = `${SCHOOL_NAME} — ${name} marked ${scanType === "OUT" ? "OUT" : status}`;
+    const body = `Dear Parent,\n\n` +
+      (scanType === "OUT"
+        ? `${name} (Roll: ${roll}) has checked OUT at ${time} on ${date}.\nSafe journey home!\n`
+        : `${name} (Roll: ${roll}) has been marked ${status}.\nTime: ${time}\nDate: ${date}\n`) +
+      `\nThis is an automated message from SmartAttend.\n— ${SCHOOL_NAME}`;
+    GmailApp.sendEmail(toEmail, subject, body);
+  } catch (err) { Logger.log("Email failed: " + err.message); }
+}
+
+// ── SEND SMS VIA FAST2SMS ─────────────────────────────────
+function sendFast2SMS(numbers, message) {
+  try {
+    UrlFetchApp.fetch("https://www.fast2sms.com/dev/bulkV2", {
+      method: "post",
+      headers: { authorization: FAST2SMS_KEY, "Content-Type": "application/json" },
+      payload: JSON.stringify({ route:"v", message, language:"english", flash:0, numbers }),
+      muteHttpExceptions: true
+    });
+  } catch (err) { Logger.log("SMS failed: " + err.message); }
+}
+
+// ── GET STUDENT LIST ──────────────────────────────────────
+function getStudentList() {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName("Students");
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const students = [];
+  for (let i = 1; i < data.length; i++) {
+    if (!data[i][0]) continue;
+    students.push({
+      uid:         String(data[i][0] || ""),
+      name:        String(data[i][1] || ""),
+      roll:        String(data[i][2] || ""),
+      phone:       String(data[i][3] || ""),
+      parentPhone: String(data[i][4] || ""),
+    });
+  }
+  return students;
+}
+
+// ── GET CURRENT TIME ──────────────────────────────────────
+function getCurrentTime() {
+  return Utilities.formatDate(new Date(), "Asia/Kolkata", "HH:mm");
+}s
