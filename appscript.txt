@@ -6,7 +6,7 @@
 // ============================================================
 
 const SPREADSHEET_ID = "1FkBVXXP0ITja1dZSuXFpoaeyQxsqM4BETyfxPFebrW8";
-const FAST2SMS_KEY   = "PB9Nub1XR6mfhcstp8rzVa4l3e52qOMLyTxJZ7AYi0QwvIGDkK38vr9MLJElyAPjiCWGf74BFXhDSo2b";
+
 const SCHOOL_NAME    = "VIT Pune";
 const LATE_HOUR      = 9;
 const LATE_MINUTE    = 0;
